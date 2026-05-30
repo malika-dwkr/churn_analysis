@@ -3,6 +3,7 @@
 ### Background
 FocAlign is a subscription-based product where active subscribers can create as many projects as they want, and they can use any of the features – Culling, Editing, or Retouching – within those projects. Each active month appears as a row in the dataset in the monthly usage logs.
 The dataset includes the following fields:
+
 •	user_id – Unique subscriber identifier
 •	active_month – The subscription-active calendar month
 •	first_payment_date – The date the user became a paying subscriber
