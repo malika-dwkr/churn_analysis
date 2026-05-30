@@ -4,13 +4,13 @@
 FocAlign is a subscription-based product where active subscribers can create as many projects as they want, and they can use any of the features – Culling, Editing, or Retouching – within those projects. Each active month appears as a row in the dataset in the monthly usage logs.
 The dataset includes the following fields:
 
-•	user_id – Unique subscriber identifier
-•	active_month – The subscription-active calendar month
-•	first_payment_date – The date the user became a paying subscriber
-•	total_projects – Number of unique projects created that month
-•	culls – Number of projects with culling used
-•	edits – Number of projects with editing used
-•	retouchs – Number of projects with retouching used
+- user_id – Unique subscriber identifier
+- active_month – The subscription-active calendar month
+- first_payment_date – The date the user became a paying subscriber
+- total_projects – Number of unique projects created that month
+- culls – Number of projects with culling used
+- edits – Number of projects with editing used
+- retouchs – Number of projects with retouching used
 
 Each user will have multiple rows, one per active month, until they churn.
 
