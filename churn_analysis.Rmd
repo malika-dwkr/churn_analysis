@@ -1,0 +1,1186 @@
+---
+title: 'User Behaviour Analysis & Churn Propensity (SaaS Domain)'
+author: "Malika Diwakar"
+date: "`r lubridate::now(tzone = 'Asia/Kolkata')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    theme: yeti
+    highlight: zenburn
+    df_print: paged
+    code_folding: show
+  word_document:
+    toc: true
+    toc_depth: '2'
+  pdf_document:
+    toc: true
+    toc_depth: '2'
+editor_options:
+  chunk_output_type: console
+---
+
+#### Global Settings 
+
+```{r setup, include = FALSE}
+
+# specify global settings for all code chunks 
+knitr::opts_chunk$set(
+  # print code for subsequent code chunks 
+  echo = TRUE,
+  # do not print messages 
+  message = FALSE,
+  # do not print warnings 
+  warning = FALSE)
+
+```
+
+#### Load Libraries
+
+```{r libraries}
+
+library(dplyr)
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(ggthemes)
+library(plotly)
+library(scales)
+library(data.table)
+library(tidyr)
+library(janitor)
+library(skimr)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(pROC)
+library(ROCR)
+library(e1071)
+
+```
+
+---
+
+## Data Preparation & Feature Engineering
+
+```{r prep}
+
+# set working directory 
+setwd("/Users/malika.diwakar/Desktop/Churn Analysis Project")
+
+## import dataset 
+dataset <- read.csv("ChurnAnalysisData.csv", header = TRUE)
+
+# view data structure 
+str(dataset)
+
+# change date columns to DATE type 
+## active_month originally contains only "YYYY-MM" (therefore '-01' is added only to enable date conversion in R) 
+dataset$active_month <- as.Date(paste0(dataset$active_month, "-01"))
+## first_payment_date 
+dataset$first_payment_date <- as.Date(dataset$first_payment_date)
+
+# confirm changes have been made 
+str(dataset)
+
+# remove serial no. column (not useful for analysis) 
+dataset <- dataset %>% 
+  select(-X)
+
+# summary statistics 
+summary(dataset)
+
+# check for missing values 
+dataset %>%
+  summarise(across(everything(), ~sum(is.na(.))))
+
+# sort each user's data in the order of time & label the tenure months 
+dataset <- dataset %>% 
+  group_by(user_id) %>% 
+  arrange(active_month, .by_group=TRUE) %>% 
+  mutate(
+    tenure_month = row_number()
+  )
+
+# create a binary "churn indicator" (where 1=churn, 0=no churn) 
+## If user stays till next month -> return value of 0 
+## If user does not stay till next month -> return value of 1 
+dataset <- dataset %>% 
+  group_by(user_id) %>% 
+  mutate(
+    next_month = lead(active_month),
+    churn_indicator = ifelse(is.na(next_month), 1, 0)
+  )
+
+# create binary variables - was the specific feature used at all? (1=yes, 0=no) 
+dataset <- dataset %>% 
+  mutate(
+    used_cull = ifelse(culls > 0, 1, 0),
+    used_edit = ifelse(edits > 0, 1, 0),
+    used_retouch = ifelse(retouchs > 0, 1, 0)
+  )
+
+# create variables "prev_projects" & "project_drop" to check for decline in usage 
+dataset <- dataset %>%
+  group_by(user_id) %>%
+  arrange(active_month, .by_group = TRUE) %>%
+  mutate(
+    prev_projects = lag(total_projects),
+    project_drop = total_projects - prev_projects
+  ) %>%
+  ungroup()
+
+# view section of dataset after making above changes 
+head(dataset)
+
+```
+
+**Interpretation:**
+
+- Converted date columns into appropriate formats for time-based analysis. 
+- Removed columns irrelevant to the analysis. 
+- Created new variables: 
+  - `tenure_month` - to track user lifecycle 
+  - `churn_indicator` - to classify whether or not users churned (where 1 = churn, and 0 = no churn) 
+  - `used_cull`, `used_edit`, and `used_retouch` - binary indicators to capture feature usage 
+  - `project_drop` - to measure month-over-month changes in engagement 
+
+---
+
+## Data Validation
+
+```{r validation}
+
+# since active_month originally contained only YYYY-MM values, '-01' was appended only to enable DATE conversion in R 
+
+# check for cases where activity month occurs before payment month 
+true_mismatch <- dataset %>%
+  filter(
+    format(active_month, "%Y-%m") <
+    format(first_payment_date, "%Y-%m")
+  )
+
+# count mismatched rows 
+nrow(true_mismatch)
+
+# count affected users 
+n_distinct(true_mismatch$user_id)
+
+# calculate % of mismatched rows 
+round((nrow(true_mismatch) / nrow(dataset)) * 100, 2)
+
+```
+
+**Notes:**
+
+- `active_month`was originally provided only at month-level granularity (YYYY-MM). To enable time-based analysis, `-01` was appended during date conversion. Therefore, this field should be interpreted as representing an *activity month rather than an exact activity date*. 
+- Some observations initially appeared to show activity occurring before the recorded `first_payment_date.` However, many of these cases were due to *differences in granularity between month-level activity data and exact payment dates*. 
+- After validating at the year-month (Y-m) level, `only 0.35%` of observations showed activity occurring before the payment month itself - a very small proportion of the dataset that is unlikely to materially affect the overall analysis. 
+- These remaining cases may reflect: 
+  - free trial usage, 
+  - delayed billing recognition, 
+  - or differences in business logic between activity and payment systems. 
+
+Since the analysis primarily relies on observed user activity patterns rather than payment timing, the impact on churn and engagement insights is expected to be minimal. 
+
+---
+
+## Analysis: Overall User Behaviour
+
+```{r overall}
+
+# overall user base behaviour based on projects made & features used 
+overall_behaviour <- dataset %>%
+  summarise(
+    # distinct no. of subscribers 
+    distinct_users = n_distinct(user_id),
+    # average projects per month 
+    avg_projects = round(mean(total_projects), 1),
+    # average culls per month 
+    avg_culls = round(mean(culls), 1),
+    # average edits per month 
+    avg_edits = round(mean(edits), 1),
+    # average retouches per month 
+    avg_retouchs = round(mean(retouchs), 1)
+  )
+
+overall_behaviour
+
+```
+
+**Interpretation:**
+
+- There are `12,175 distinct` users in the dataset. 
+- On average, users create `8.8 projects` per active month. 
+
+Feature usage patterns: 
+
+- `Editing` is the most widely used feature (`~5.6` edits per month). 
+- `Culling` follows closely behind (`~4.7` culls per month). 
+- `Retouching` is significantly less used (`~0.3` retouches per month) due to its recent introduction on the platform. This average is weighed down by users who haven't encountered the feature yet. 
+
+_Editing and Culling are central to user workflows, while Retouching is still yet to gain traction as more users discover the feature._ 
+
+---
+
+## Churned vs Retained Subscribers
+
+```{r churn}
+
+# check for changes in user behaviour before churn 
+## churned vs retained: average no. of projects & features used 
+churn_analysis <- dataset %>%
+  group_by(churn_indicator) %>%
+  summarise(
+    avg_projects = mean(total_projects),
+    avg_culls = mean(culls),
+    avg_edits = mean(edits),
+    avg_retouch = mean(retouchs)
+  )
+
+churn_analysis
+
+## churned vs retained: check % of total users that used each feature 
+feature_usage_comparison <- dataset %>%
+  group_by(churn_indicator) %>%
+  summarise(
+    used_cull = mean(used_cull),
+    used_edit = mean(used_edit),
+    used_retouch = mean(used_retouch)
+  )
+
+feature_usage_comparison
+
+# plot feature usage graph 
+## step 1: clean feature names 
+feature_plot <- feature_usage_comparison %>%
+  pivot_longer(
+    cols = c(used_cull, used_edit, used_retouch),
+    names_to = "feature",
+    values_to = "usage"
+  ) %>%
+  mutate(
+    feature = recode(feature,
+      used_cull = "Used Culling",
+      used_edit = "Used Editing",
+      used_retouch = "Used Retouching"
+    )
+  )
+
+# relabel "0" and "1" in legend 
+feature_plot <- feature_plot %>%
+  mutate(
+    churn_indicator = factor(
+      churn_indicator,
+      levels = c(0, 1),
+      labels = c("Retained", "Churned")
+    )
+  )
+
+## step 2: plot the graph 
+ggplotly(ggplot(feature_plot, aes(x = feature, y = usage, fill = factor(churn_indicator))) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(values = c("#2E86AB", "#F18F01"),
+                    labels = c("Retained", "Churned")) +
+  labs(
+    title = "Feature Usage: Churned vs Retained Users",
+    x = "Feature",
+    y = "Usage Rate",
+    fill = "User Type"
+  ) +
+  theme_minimal()
+)
+
+```
+
+**Interpretation:**
+
+- Churned users show a modest decline in activity, indicating that _churn is not driven by a sharp drop in usage_. 
+- `Editing` shows the _largest usage gap_ (retained users use editing ~9% more), suggesting it to be a key retention driver. 
+- Higher `retouch` usage among churned users indicates _isolated feature usage_ rather than full product adoption (culling -> editing -> retouching). 
+
+---
+
+## Month-on-Month (MoM) - Time Series Analysis
+
+```{r mom_1}
+
+# churn rate by each tenure month 
+churn_by_tenure <- dataset %>%
+  group_by(user_id) %>%
+  summarise(tenure_month = max(tenure_month)) %>% # when each user churned 
+  group_by(tenure_month) %>%
+  summarise(churn_count = n()) %>%
+  mutate(
+    churn_rate = churn_count / sum(churn_count)
+  )
+
+# plot the churn rate graph 
+## step 1: clean values 
+churn_by_tenure <- churn_by_tenure %>%
+  mutate(churn_rate = round(churn_rate, 3))
+## step 2: plot the graph 
+ggplotly(ggplot(churn_by_tenure, aes(x = tenure_month, y = churn_rate)) +
+    geom_line(color="#B22222") +
+    geom_point(color="#1874CD") +
+    scale_y_continuous(
+      labels = scales::label_percent(accuracy = 1),
+      limits = c(0, 0.2),
+      breaks = seq(0, 0.2, by = 0.05)
+    ) +
+    scale_x_continuous(
+      breaks = seq(0, 25, by = 5),
+      limits = c(0, 25)
+    ) +
+    labs(
+      title = "Churn Distribution by Tenure Month (%)",
+      x = "Tenure Month",
+      y = "% of Total Churn"
+    ) +
+    theme_minimal()
+)
+
+```
+
+**Interpretation:** 
+
+The highest churn activity occurs within the first 5 months, highlighting early-stage risk. Early engagement and feature adoption is critical for long-term subscriber retention. 
+
+```{r mom_2}
+
+# total projects MoM 
+mom_projects <- dataset %>%
+  group_by(tenure_month) %>%
+  summarise(
+    avg_projects = mean(total_projects)
+  )
+
+# plot the average MoM projects graph 
+ggplotly(ggplot(mom_projects, aes(x=tenure_month, y=avg_projects)) +
+  geom_line(color="#009ACD") +
+  geom_point(color="#CD5B45") +
+  labs(
+    title = "Projects Completed Over the Tenure Months",
+    x = "Tenure Month",
+    y = "Average Number of Projects"
+  ) +
+  theme_minimal()
+)
+
+```
+
+**Interpretation:** 
+
+Users who continue their subscriptions for longer periods display increased project activity while early-stage users show lower/declining usage. 
+
+```{r mom_3}
+
+# MoM feature usage 
+mom_feature_usage <- dataset %>%
+  group_by(tenure_month) %>%
+  summarise(
+    avg_projects = mean(total_projects),
+    avg_culls = mean(culls),
+    avg_edits = mean(edits),
+    avg_retouch = mean(retouchs)
+  )
+
+# plot the MoM feature usage graph - multi-line 
+## step 1: clean feature names 
+mom_feature_plot <- mom_feature_usage %>%
+  pivot_longer(
+    cols = c(avg_projects, avg_culls, avg_edits, avg_retouch),
+    names_to = "feature",
+    values_to = "value"
+  ) %>%
+  mutate(
+    feature = recode(feature,
+      avg_projects = "Projects",
+      avg_culls = "Culling",
+      avg_edits = "Editing",
+      avg_retouch = "Retouching"
+    )
+  )
+
+## step 2: create the plot 
+ggplotly(ggplot(mom_feature_plot, aes(x = tenure_month, y = value, color = feature)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.7) +
+  scale_color_manual(values = c("#1B9E77", "#D95F02", "#7570B3", "#E7298A")) +
+  labs(
+    title = "How Feature Usage Has Evolved Over Time",
+    x = "Tenure Month",
+    y = "Average Usage",
+    color = "Feature"
+  ) +
+  theme_minimal()
+)
+
+```
+
+**Interpretation:** 
+
+`Editing` and `Culling` contribute the most to overall projects (and are often used together), while `Retouching` remains the least used feature mainly because it was recently introduced. Among established users, however, average `Retouching` usage has already grown from ~0.5 to ~1.3 per month over 22 active months, suggesting strong adoption momentum. 
+
+---
+
+## High-Risk Target Group/Segment (TG)
+
+```{r tg_1}
+
+# define threshold (bottom 25% quartile) for total projects done by TG 
+threshold_projects <- quantile(dataset$total_projects, 0.25, na.rm = TRUE)
+
+# classification: TG vs non-TG 
+dataset <- dataset %>%
+  mutate(
+    high_risk_flag = ifelse(
+      used_edit == 0 &
+      tenure_month <= 5 &
+      total_projects <= threshold_projects &
+      (!is.na(project_drop) & project_drop < 0),
+      1, 0
+    )
+  )
+
+```
+
+**Interpretation:** 
+
+Based on the analysis, the high-risk target segment can be defined by: 
+
+- No editing usage (i.e. not using the core popular feature) 
+- Early lifecycle stage (tenure month <= 5) 
+- Low project activity (bottom 25% quartile) 
+- Declining engagement (project_drop < 0) 
+
+_Users in this segment are not receiving enough value from the product, making them highly prone to churning._ 
+
+```{r tg_2}
+
+# extract only user-level data (total 12,175 distinct users) 
+user_level_data <- dataset %>%
+  group_by(user_id) %>%
+  summarise(
+    high_risk_flag = max(high_risk_flag),
+    churn_rate = mean(churn_indicator),
+    avg_projects = mean(total_projects),
+    avg_culls = mean(culls),
+    avg_edits = mean(edits),
+    avg_retouch = mean(retouchs),
+    edit_adoption = mean(used_edit),
+    cull_adoption = mean(used_cull),
+    retouch_adoption = mean(used_retouch)
+  )
+
+# what % of total users are from the target segment? 
+tg_size <- user_level_data %>%
+  ungroup() %>% 
+  summarise(
+    total_users = n_distinct(user_id),
+    tg_users = n_distinct(user_id[high_risk_flag == 1])
+  ) %>%
+  mutate(
+    tg_percentage = tg_users / total_users
+  )
+
+tg_size
+
+```
+
+**Interpretation:** 
+
+Out of 12,175 total users, *~30% users (3,613)* are part of the high-risk segment. 
+
+``` {r tg_3}
+
+# quantify & compare TG vs non-TG 
+tg_compare <- user_level_data %>%
+  group_by(high_risk_flag) %>%
+  summarise(
+    users = n(),
+    churn_rate = mean(churn_rate),
+    avg_projects = mean(avg_projects),
+    avg_culls = mean(avg_culls),
+    avg_edits = mean(avg_edits),
+    avg_retouch = mean(avg_retouch)
+  ) %>%
+  mutate(
+    segment = ifelse(high_risk_flag == 1, "High Risk TG", "Others"),
+    user_percentage = users / sum(users)
+  )
+
+tg_compare
+
+# plot TG vs non-TG churn rate graph 
+## step 1: clean feature names 
+tg_plot <- user_level_data %>%
+  group_by(high_risk_flag) %>%
+  summarise(
+    churn_rate = mean(churn_rate)
+  ) %>%
+  mutate(
+    segment = ifelse(high_risk_flag == 1, "High Risk", "Others")
+  )
+
+## step 2: create the plot 
+ggplotly(ggplot(tg_plot, aes(x = segment, y = churn_rate, fill = segment)) +
+  geom_col(width = 0.6) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(values = c("#E63946", "#457B9D")) +
+  labs(
+    title = "Churn Rate: High-Risk vs Other Users",
+    x = "",
+    y = "Churn Rate",
+    fill = "Segment"
+  ) +
+  theme_minimal()
+)
+
+```
+
+**Interpretation:** 
+
+The target group (TG) is a sizable `30% of the user base`. 
+
+Now that we have a defined TG and a comparison of usage patterns, we can see that: 
+
+- Feature usage and project activity is significantly lower in the TG, indicating low engagement across the full editing workflow. 
+- However, the non-TG shows a higher churn rate (45%) than the TG's (23%), suggesting that churn is not solely driven by low usage, but may also be influenced by alternative behaviours such as: 
+  - completion of user objectives 
+  - switching to alternatives that suit their needs better 
+  - pricing factors 
+
+---
+
+## Retention Curve 
+
+```{r rc}
+
+# show distinct active users across each month 
+retention_curve <- dataset %>%
+  group_by(tenure_month) %>%
+  summarise(
+    active_users = n_distinct(user_id)
+  )
+
+# plot the retention curve 
+ggplotly(ggplot(retention_curve, aes(x = tenure_month, y = active_users)) +
+  geom_line(linewidth = 0.8, color = "#E63946") +
+  geom_point(size = 1.7, color = "#1D3557") +
+  labs(
+    title = "User Retention Curve",
+    x = "Tenure Month",
+    y = "Active Users"
+  ) +
+  theme_minimal()
+)
+
+```
+
+**Interpretation:** 
+
+Retention drops significantly in months 2 (`-2,290 users`) and 3 (`-2,099 users`), highlighting the importance of early engagement in reducing churn. Survival past this window is a strong signal of product-value fit, correlating with markedly higher long-term retention. 
+
+---
+
+## Predictive Analysis
+
+### Redefining Churn Using a Cutoff Month
+
+```{r pred_1}
+
+# define cutoff as the most recent month in the dataset 
+cutoff_month <- max(dataset$active_month)
+
+# create a true user-level churn flag 
+user_churn <- dataset %>%
+  group_by(user_id) %>%
+  summarise(last_active_month = max(active_month)) %>%
+  mutate(
+    # if last active month is before the cutoff, user has churned 
+    churned = ifelse(last_active_month < cutoff_month, 1, 0)
+  ) %>%
+  select(user_id, churned)
+
+# check class balance 
+table(user_churn$churned)
+
+prop.table(table(user_churn$churned))
+
+# each user should appear as ONE row with aggregated behavioural features 
+# target variable is whether the user ultimately churned or not 
+model_data <- dataset %>%
+  group_by(user_id) %>%
+  summarise(
+    total_tenure     = max(tenure_month),
+    avg_projects     = mean(total_projects),
+    avg_culls        = mean(culls),
+    avg_edits        = mean(edits),
+    avg_retouch      = mean(retouchs),
+    edit_adoption    = mean(used_edit),
+    cull_adoption    = mean(used_cull),
+    retouch_adoption = mean(used_retouch),
+    avg_project_drop = mean(project_drop, na.rm = TRUE),
+    high_risk_flag   = max(high_risk_flag)
+  ) %>%
+  ungroup() %>%
+  # join the newly defined churn flag 
+  left_join(user_churn, by = "user_id")
+
+# confirm class balance is consistent 
+table(model_data$churned)
+
+prop.table(table(model_data$churned))
+
+```
+
+### Prepare Features for Modelling
+
+```{r pred_2}
+
+# remove user_id (not a predictor) and convert target variable to factor for classification 
+model_df <- model_data %>%
+  select(-user_id) %>%
+  mutate(churned = factor(churned, levels = c(0, 1), labels = c("Retained", "Churned")))
+
+# check for any remaining missing values 
+colSums(is.na(model_df))
+
+# replace any missing values in avg_project_drop with 0 (i.e. when first month has no lag) 
+model_df <- model_df %>%
+  mutate(avg_project_drop = replace_na(avg_project_drop, 0))
+
+# confirm there are no more missing values 
+colSums(is.na(model_df))
+
+```
+
+### Split Training & Testing Data
+
+```{r pred_3}
+
+# set seed for reproducibility 
+set.seed(123)
+
+# split training & testing data in 80-20 partition 
+train_index <- createDataPartition(model_df$churned, p = 0.8, list = FALSE)
+
+train_data <- model_df[train_index, ]
+
+test_data  <- model_df[-train_index, ]
+
+# confirm class balance is maintained in both splits 
+prop.table(table(train_data$churned))
+
+prop.table(table(test_data$churned))
+
+```
+
+### Define Cross-Validation Control
+
+Using 5-fold cross-validation splits the training data into 5 parts (trains on 4, validates on 1, and repeats 5 times), giving a more reliable performance estimate than a single train/test split. 
+
+```{r pred_4}
+
+# use 5-fold cross-validation during training to reduce overfitting 
+train_control <- trainControl(
+  method = "cv",                      # cross-validation 
+  number = 5,                         # 5 folds 
+  classProbs = TRUE,                  # return predicted probabilities (needed for AUC/ROC metrics) 
+  summaryFunction = twoClassSummary,  # returns AUC, Sensitivity, Specificity 
+  savePredictions = "final"
+)
+
+```
+
+## Model 1 - Logistic Regression
+
+Logistic Regression: a linear model that estimates the probability of churn, (a good baseline for binary classification). 
+
+```{r pred_5_logit}
+
+# set seed for reproducibility 
+set.seed(123)
+
+# build logit model 
+model_logit <- train(
+  churned ~ .,
+  data = train_data,
+  method = "glm",
+  family = "binomial",
+  metric = "ROC",
+  trControl = train_control
+)
+
+# view logistic model summary 
+summary(model_logit)
+
+# predict on test data 
+pred_logit <- predict(model_logit, newdata = test_data)
+
+pred_logit_prob <- predict(model_logit, newdata = test_data, type = "prob")[, "Churned"]
+
+# confusion matrix 
+cm_logit <- confusionMatrix(pred_logit, test_data$churned, positive = "Churned")
+
+cm_logit
+
+# AUC-ROC: measures how well the model distinguishes churned vs retained 
+roc_logit <- roc(test_data$churned, pred_logit_prob, levels = c("Retained", "Churned"))
+
+auc(roc_logit)
+
+```
+
+**Interpretation:** 
+
+**1. Model Coefficients & Predictor Significance** 
+
+- All 11 predictors are statistically significant, with 10 significant at the 99.9% confidence level (3 stars *** ) and `cull_adoption` significant at the 95% level (1 star * ). 
+- Negative coefficients indicate the variable reduces churn probability. 
+  - `retouch_adoption` has the strongest protective effect (-2.15), followed by `edit_adoption` (-0.63), 
+  - suggesting that consistent feature adoption is the biggest driver of retention. 
+- Positive coefficients indicate the variable increases churn probability. 
+  - `avg_projects` (+0.13) and `high_risk_flag` (+0.24) both increase churn risk, 
+  - confirming that the high-risk segment defined in the EDA is a valid churn signal. 
+- `total_tenure` (-0.14) confirms that the longer a user stays, the less likely they are to churn. 
+  - This is consistent with the EDA finding that survival past the first 5 months strongly predicts long-term retention. 
+
+**2. Model Fit** 
+
+The model explains a meaningful portion of churn variance (null deviance: 13,354 and residual deviance: 11,374), performing reasonably well as a baseline with an AUC of 0.74. 
+
+**3. Limitation** 
+
+Assumption of linear relationships: non-linear patterns in user behaviour are not captured here, which is where Random Forest and XGBoost are expected to improve. 
+
+---
+
+## Model 2 - Random Forest
+
+Random Forest: an ensemble of decision trees. 
+
+- Each tree is trained on a random subset of data and features. 
+- Final prediction = majority vote across all trees. 
+- More powerful than logistic regression for non-linear relationships. 
+
+```{r pred_6_rf}
+
+# set seed for reproducibility 
+set.seed(123)
+
+# build random forest model 
+model_rf <- train(
+  churned ~ .,
+  data = train_data,
+  method = "rf",
+  metric = "ROC",
+  trControl = train_control,
+  tuneLength = 3
+)
+
+# view tuning results 
+print(model_rf)
+
+# feature importance in driving churn 
+varImp(model_rf) %>% plot(main = "Random Forest - Feature Importance")
+
+# predict on test data 
+pred_rf <- predict(model_rf, newdata = test_data)
+
+pred_rf_prob <- predict(model_rf, newdata = test_data, type = "prob")[, "Churned"]
+
+# confusion matrix 
+cm_rf <- confusionMatrix(pred_rf, test_data$churned, positive = "Churned")
+
+cm_rf
+
+# AUC-ROC 
+roc_rf <- roc(test_data$churned, pred_rf_prob, levels = c("Retained", "Churned"))
+
+auc(roc_rf)
+
+```
+
+**Interpretation:** 
+
+**1. Hyperparameter Tuning** 
+
+- The model was tested across 3 values of `mtry` (the number of features randomly considered at each tree split): 2, 6, and 10. 
+- `mtry = 2` was selected as optimal based on the highest AUC/ROC (0.766), despite higher `mtry` values producing slightly better sensitivity. 
+
+**2. Feature Importance** 
+
+- `total_tenure` (100) is the strongest predictor of churn, followed closely by `avg_edits` (97.98), `avg_projects` (96.57), and `avg_project_drop` (95.13), confirming that lifecycle stage and engagement trends are the most predictive signals. 
+- `high_risk_flag` scored 0, meaning it adds no additional predictive value beyond its underlying features that are are already included in the model (as expected). 
+
+**3. Model Performance** 
+
+- AUC = 0.7579, a slight improvement from the logistic regression model (0.7403), indicating that Random Forest better captures non-linear relationships in the data. 
+- Accuracy improved slightly to 69.8% (vs 68.5% in logistic regression). 
+- Sensitivity held steady at 68.3%, identifying the same proportion of actual churners as logistic regression. 
+- Specificity improved to 71.1% (vs 68.7% in logistic regression), suggesting that Random Forest is better at correctly identifying retained users, which helps reduce unnecessary retention spend on low-risk users. 
+
+---
+
+## Model 3 - XGBoost
+
+XGBoost: gradient-boosted trees, where each new tree corrects the errors of the previous one. 
+
+```{r pred_7_xgb}
+
+# XGBoost requires a numeric matrix for predictors and numeric 0/1 values for the target variable 
+# prepare training and testing data (keep churned as factor for later evaluation) 
+train_xgb <- train_data %>%
+  mutate(churned = factor(churned, levels = c("Retained", "Churned")))
+
+test_xgb <- test_data %>%
+  mutate(churned = factor(churned, levels = c("Retained", "Churned")))
+
+# prepare training matrix 
+train_matrix <- xgb.DMatrix(
+  data = as.matrix(train_xgb %>% select(-churned)),
+  label = ifelse(train_xgb$churned == "Churned", 1, 0)
+)
+
+# prepare test matrix 
+test_matrix <- xgb.DMatrix(
+  data = as.matrix(test_xgb %>% select(-churned)),
+  label = ifelse(test_xgb$churned == "Churned", 1, 0)
+)
+
+# set parameters 
+xgb_params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eta = 0.1,
+  max_depth = 5,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  min_child_weight = 1,
+  gamma = 0
+)
+
+# set seed for reproducibility 
+set.seed(123)
+
+# train with cross-validation to find best number of rounds 
+xgb_cv <- xgb.cv(
+  params = xgb_params,
+  data = train_matrix,
+  nrounds = 200,
+  nfold = 5,
+  verbose = 0,
+  early_stopping_rounds = 20
+)
+
+# use best_iteration if available, otherwise use round with highest test AUC 
+best_nrounds <- if (!is.null(xgb_cv$best_iteration) && length(xgb_cv$best_iteration) > 0) {
+  xgb_cv$best_iteration
+} else {
+  which.max(xgb_cv$evaluation_log$test_auc_mean)
+}
+
+best_nrounds
+
+# train final model using best number of rounds 
+model_xgb <- xgb.train(
+  params = xgb_params,
+  data = train_matrix,
+  nrounds = best_nrounds,
+  verbose = 0
+)
+
+# feature importance 
+xgb_importance <- xgb.importance(model = model_xgb)
+
+xgb.plot.importance(xgb_importance, main = "XGBoost - Feature Importance")
+
+# predict on test set 
+pred_xgb_prob <- predict(model_xgb, newdata = test_matrix)
+
+# convert probabilities to class labels using 0.5 threshold 
+pred_xgb <- factor(
+  ifelse(pred_xgb_prob >= 0.5, "Churned", "Retained"),
+  levels = c("Retained", "Churned")
+)
+
+# confusion matrix 
+cm_xgb <- confusionMatrix(pred_xgb, test_xgb$churned, positive = "Churned")
+
+cm_xgb
+
+# AUC-ROC 
+roc_xgb <- roc(test_xgb$churned, pred_xgb_prob, levels = c("Retained", "Churned"))
+
+auc(roc_xgb)
+
+```
+
+**Interpretation:** 
+
+**1. Training & Tuning** 
+
+86 boosting rounds were identified as optimal, meaning the model built 86 sequential trees, each correcting the errors of the previous one, before performance stopped improving. 
+
+**2. Feature Importance** 
+
+- `avg_retouch` (0.236) and `total_tenure` (0.216) are the top 2 predictors, a slight change from Random Forest where `total_tenure` ranked first, suggesting XGBoost is picking up on retouching behaviour as a stronger differentiating signal than the other models. 
+- `avg_edits`, `avg_projects`, and `avg_project_drop` continue to rank highly, consistent with findings across all 3 models. 
+- `high_risk_flag` again scores near zero (0.005), further confirming it carries no independent predictive value beyond its underlying features. 
+
+**3. Model Performance** 
+
+- AUC = 0.7796 (highest across all 3 models) confirms that XGBoost best captures the complexity of churn behaviour in this dataset. 
+- Accuracy improved to 70.9%, sensitivity to 70%, and specificity to 71.6%, all being improvements over both previous models. 
+- The model is well-balanced between catching actual churners (70% sensitivity) and correctly clearing retained users (71.6% specificity), making it the most reliable model for risk scoring. 
+
+---
+
+## Model Comparison
+
+```{r compare_models}
+
+# compile AUC scores for all 3 models 
+model_comparison <- data.frame(
+  Model = c("Logistic Regression", "Random Forest", "XGBoost"),
+  AUC = round(c(
+    auc(roc_logit),
+    auc(roc_rf),
+    auc(roc_xgb)
+  ), 4),
+  Accuracy = round(c(
+    cm_logit$overall["Accuracy"],
+    cm_rf$overall["Accuracy"],
+    cm_xgb$overall["Accuracy"]
+  ), 4),
+  Sensitivity = round(c(
+    cm_logit$byClass["Sensitivity"],
+    cm_rf$byClass["Sensitivity"],
+    cm_xgb$byClass["Sensitivity"]
+  ), 4),
+  Specificity = round(c(
+    cm_logit$byClass["Specificity"],
+    cm_rf$byClass["Specificity"],
+    cm_xgb$byClass["Specificity"]
+  ), 4)
+)
+
+model_comparison
+
+# plot ROC curves for all 3 models 
+## step 1: combine all 3 ROC objects into a named list 
+roc_list <- list(
+  "Logistic Regression" = roc_logit,
+  "Random Forest" = roc_rf,
+  "XGBoost" = roc_xgb
+)
+## step 2: plot all ROC curves together 
+ggplotly(
+  ggroc(roc_list, linewidth = 0.8) +
+    scale_color_manual(
+      values = c(
+        "Logistic Regression" = "#457B9D",
+        "Random Forest" = "#2A9D8F",
+        "XGBoost" = "#E63946"
+      ),
+      labels = c(
+        paste("Logistic Regression (AUC =", round(auc(roc_logit), 3), ")"),
+        paste("Random Forest (AUC =", round(auc(roc_rf), 3), ")"),
+        paste("XGBoost (AUC =", round(auc(roc_xgb), 3), ")")
+      )
+    ) +
+    geom_abline(slope = 1, intercept = 1,
+                linetype = "dashed", color = "grey50") +
+    labs(
+      title = "ROC Curve Comparison - All Models",
+      x = "Specificity",
+      y = "Sensitivity",
+      color = "Model"
+    ) +
+    theme_minimal()
+)
+
+```
+
+**Interpretation:** 
+
+- All 3 models perform meaningfully above random chance, with AUC scores ranging between 0.74 - 0.78. 
+- XGBoost is the best performing model across every metric - highest AUC (0.7796), accuracy (70.9%), sensitivity (70%), and specificity (71.6%) - and is therefore selected as the final model for risk tier stratification. 
+
+---
+
+## Risk Tier Stratification using Best Model
+
+We will use XGBoost (the best performing model). 
+
+```{r risk_tiers}
+
+# prepare full user-level dataset as a numeric matrix 
+full_model_df <- model_data %>%
+  select(-user_id, -churned) %>%
+  mutate(avg_project_drop = replace_na(avg_project_drop, 0))
+
+full_matrix <- xgb.DMatrix(
+  data = as.matrix(full_model_df)
+)
+
+# generate churn probability scores for every user using XGBoost 
+churn_probs <- predict(model_xgb, newdata = full_matrix)
+
+# assign risk tiers using 33rd / 67th percentile cut-offs (dividing into thirds) 
+risk_scores <- model_data %>%
+  select(user_id, churned) %>%
+  mutate(
+    churn_prob = churn_probs,
+    risk_tier = case_when(
+      churn_prob >= quantile(churn_probs, 0.67) ~ "High Risk",
+      churn_prob >= quantile(churn_probs, 0.33) ~ "Medium Risk",
+      TRUE ~ "Low Risk"
+    ),
+    risk_tier = factor(risk_tier, levels = c("Low Risk", "Medium Risk", "High Risk"))
+  )
+
+# distribution of users across tiers 
+risk_scores %>%
+  count(risk_tier) %>%
+  mutate(percentage = scales::percent(n / sum(n)))
+
+```
+
+**Interpretation:** 
+
+- XGBoost was used to generate individual churn probability scores between 0 and 1 for all 12,175 users. 
+- Users were then divided into 3 risk tiers using the 33rd and 67th percentiles. 
+- The 3 tiers are broadly even in size: 
+  - Low Risk (33%, 4,012 users) 
+  - Medium Risk (34%, 4,145 users) 
+  - High Risk (33%, 4,018 users) 
+
+- The even distribution is intentional by splitting at percentile thresholds rather than fixed probability values. 
+- Every user is assigned a tier relative to the rest of the user base, ensuring no tier is too small to act on or too large to target efficiently. 
+
+--- 
+
+## Risk Tier Profiling & Benchmarking
+
+```{r}
+
+# join risk scores with full behavioural features for profiling 
+risk_profile <- risk_scores %>%
+  left_join(model_data, by = "user_id")
+
+# behavioural summary per tier 
+tier_summary <- risk_profile %>%
+  group_by(risk_tier) %>%
+  summarise(
+    users = n(),
+    actual_churn_rate = scales::percent(mean(churned.x), accuracy = 0.1),
+    avg_churn_prob = round(mean(churn_prob), 3),
+    avg_tenure = round(mean(total_tenure), 1),
+    avg_projects = round(mean(avg_projects), 1),
+    avg_edits = round(mean(avg_edits), 1),
+    edit_adoption_pct = scales::percent(mean(edit_adoption), accuracy = 0.1),
+    cull_adoption_pct = scales::percent(mean(cull_adoption), accuracy = 0.1),
+    high_risk_pct = scales::percent(mean(high_risk_flag), accuracy = 0.1)
+  )
+
+tier_summary
+
+# plot churn probability distribution by risk tier 
+ggplotly(
+  ggplot(risk_scores, aes(x = churn_prob, fill = risk_tier)) +
+    geom_histogram(bins = 40, alpha = 0.8, position = "identity") +
+    scale_fill_manual(values = c("#2A9D8F", "#F4A261", "#E63946")) +
+    labs(
+      title = "Churn Probability Distribution by Risk Tier",
+      x = "Predicted Churn Probability",
+      y = "Number of Users",
+      fill = "Risk Tier"
+    ) +
+    theme_minimal()
+)
+
+# plot actual vs predicted churn rate per tier 
+## step 1: separate plot data for risk tiers 
+tier_plot_data <- risk_profile %>%
+  group_by(risk_tier) %>%
+  summarise(
+    actual_churn_rate = mean(churned.x),
+    avg_churn_prob = mean(churn_prob)
+  ) %>%
+  pivot_longer(
+    cols = c(actual_churn_rate, avg_churn_prob),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(
+    metric = recode(metric,
+      actual_churn_rate = "Actual Churn Rate",
+      avg_churn_prob = "Avg Predicted Probability"
+    )
+  )
+## step 2: create plot 
+ggplotly(
+  ggplot(tier_plot_data, aes(x = risk_tier, y = value, fill = metric)) +
+    geom_col(position = "dodge", width = 0.8) +
+    scale_y_continuous(labels = scales::percent_format()) +
+    scale_fill_manual(values = c("#457B9D", "#E63946")) +
+    labs(
+      title = "Actual vs Predicted Churn Rate by Risk Tiers",
+      x = "Risk Tier",
+      y = "Rate / Probability",
+      fill = "Metric"
+    ) +
+    theme_minimal()
+)
+
+```
+
+**Interpretation:** 
+
+- `Low Risk` users have: 
+  - lowest churn rate (10.8%) 
+  - longest average tenure (9.4 months) 
+  - highest project activity (12.3 projects, 8.2 edits) 
+  - strong feature adoption (86.6% editing, 73.4% culling) 
+  
+_These are well-engaged users who have clearly found value in the product._ 
+
+- `Medium Risk` users sit in the middle with: 
+  - 45.2% churn rate 
+  - shorter tenure (4.8 months) 
+  - moderately lower engagement 
+  
+_They are active but have not yet demonstrated the consistent feature adoption seen in Low Risk users._ 
+
+- `High Risk` users show: 
+  - 75.3% churn rate 
+  - shortest tenure (3.4 months) 
+  - lowest project activity (4.3 projects, 1.8 edits) 
+  - significantly lower feature adoption (44.8% editing, 53.1% culling) 
+  
+_This is consistent with early-stage users who have not yet realised product value._ 
+
+### Export Data to CSV
+
+```{r export_data, include = FALSE}
+
+# user-level risk tier assignments 
+write.csv(
+  risk_scores %>% select(user_id, churn_prob, risk_tier),
+  "/Users/malika.diwakar/Desktop/Churn Analysis Project/user_risk_tiers.csv",
+  row.names = FALSE
+)
+
+# cleaned version of original dataset 
+write.csv(
+  dataset, 
+  "/Users/malika.diwakar/Desktop/Churn Analysis Project/cleaned_data.csv", 
+  row.names = FALSE)
+
+```
+
