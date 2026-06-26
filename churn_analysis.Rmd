@@ -1031,20 +1031,26 @@ full_matrix <- xgb.DMatrix(
 # generate churn probability scores for every user using XGBoost 
 churn_probs <- predict(model_xgb, newdata = full_matrix)
 
-# assign risk tiers using 33rd / 67th percentile cut-offs (dividing into thirds) 
+# view churn probability distribution 
+summary(churn_probs)
+
+# assign risk tiers using 0.4 and 0.7 as cut-offs 
 risk_scores <- model_data %>%
   select(user_id, churned) %>%
   mutate(
     churn_prob = churn_probs,
     risk_tier = case_when(
-      churn_prob >= quantile(churn_probs, 0.67) ~ "High Risk",
-      churn_prob >= quantile(churn_probs, 0.33) ~ "Medium Risk",
+      churn_prob >= 0.7 ~ "High Risk",
+      churn_prob >= 0.4 ~ "Medium Risk",
       TRUE ~ "Low Risk"
     ),
-    risk_tier = factor(risk_tier, levels = c("Low Risk", "Medium Risk", "High Risk"))
+    risk_tier = factor(
+      risk_tier,
+      levels = c("Low Risk", "Medium Risk", "High Risk")
+    )
   )
 
-# distribution of users across tiers 
+# view mix of users across tiers 
 risk_scores %>%
   count(risk_tier) %>%
   mutate(percentage = scales::percent(n / sum(n)))
@@ -1054,14 +1060,11 @@ risk_scores %>%
 **Interpretation:** 
 
 - XGBoost was used to generate individual churn probability scores between 0 and 1 for all 12,175 users. 
-- Users were then divided into 3 risk tiers using the 33rd and 67th percentiles. 
-- The 3 tiers are broadly even in size: 
-  - Low Risk (33%, 4,012 users) 
-  - Medium Risk (34%, 4,145 users) 
-  - High Risk (33%, 4,018 users) 
-
-- The even distribution is intentional by splitting at percentile thresholds rather than fixed probability values. 
-- Every user is assigned a tier relative to the rest of the user base, ensuring no tier is too small to act on or too large to target efficiently. 
+- Users were then divided into 3 risk tiers using 0.4 and 0.7 as the cut-offs for assigning the risk tiers. 
+- The 3 tiers are distributed as: 
+  - Low Risk (42.1%, 5,120 users) - a healthy user base 
+  - Medium Risk (41.1%, 5,001 users) - watch and nurture 
+  - High Risk (16.9%, 2,054 users) - serious intervention needed 
 
 --- 
 
@@ -1143,25 +1146,26 @@ ggplotly(
 **Interpretation:** 
 
 - `Low Risk` users have: 
-  - lowest churn rate (10.8%) 
-  - longest average tenure (9.4 months) 
-  - highest project activity (12.3 projects, 8.2 edits) 
-  - strong feature adoption (86.6% editing, 73.4% culling) 
+  - lowest churn rate (15.4%) 
+  - longest average tenure (8.8 months) 
+  - highest project activity (11.5 projects, 7.8 edits) 
+  - strong feature adoption (85.6% editing, 73.5% culling) 
   
 _These are well-engaged users who have clearly found value in the product._ 
 
 - `Medium Risk` users sit in the middle with: 
-  - 45.2% churn rate 
-  - shorter tenure (4.8 months) 
-  - moderately lower engagement 
+  - 57% churn rate 
+  - shorter tenure (3.9 months) 
+  - around 50% lower activity than Low-Risk users (6 projects, 3.3 edits) 
+  - moderately lower feature adoption (66.7% editing, 67.6% culling) 
   
 _They are active but have not yet demonstrated the consistent feature adoption seen in Low Risk users._ 
 
 - `High Risk` users show: 
-  - 75.3% churn rate 
+  - 82.6% churn rate 
   - shortest tenure (3.4 months) 
-  - lowest project activity (4.3 projects, 1.8 edits) 
-  - significantly lower feature adoption (44.8% editing, 53.1% culling) 
+  - lowest project activity (4.2 projects, 1.7 edits) 
+  - significantly lower feature adoption (35.3% editing, 49% culling) 
   
 _This is consistent with early-stage users who have not yet realised product value._ 
 
