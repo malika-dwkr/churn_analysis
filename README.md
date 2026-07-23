@@ -52,7 +52,7 @@ While the TG shows significantly lower usage and feature adoption, a higher prop
 •	`total_tenure` being the strongest or second strongest predictor across all 3 models reinforced this finding. 
 
 *4. Incomplete workflow adoption is a stronger churn signal than raw activity levels.* 
-•	Users who fail to consistently move through the editing pipeline (culling  editing  retouching) show higher churn propensity than users with low but structured engagement. 
+•	Users who fail to consistently move through the editing pipeline (culling -> editing -> retouching) show higher churn propensity than users with low but structured engagement. 
 •	`retouch_adoption` carried the strongest protective coefficient in the logistic regression model (-2.15), further supporting this. 
 
 *5. XGBoost is the best performing churn prediction model.* 
