@@ -46,11 +46,11 @@ To perform data analysis on this dataset to:
 
 ### Key Insights
 
-** 1. Churn is not directly a result of low engagement. **
+**1. Churn is not directly a result of low engagement.**
 
 - While the TG shows significantly lower usage and feature adoption, a higher proportion of churn is actually observed among active low-risk users. Therefore, low engagement alone does not fully explain churn behaviour. 
 
-** 2. Editing is the most critical feature linked to retention. **
+2. **Editing is the most critical feature linked to retention.**
 
 - `Editing` shows the largest behavioural gap between retained and churned users, acting as the core feature within the product workflow. 
 - This was further validated by the predictive models, where `avg_edits` and `edit_adoption` consistently ranked among the top predictors of churn across all 3 models. 
