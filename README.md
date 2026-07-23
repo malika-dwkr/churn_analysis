@@ -100,20 +100,20 @@ Users returning after a period of inactivity are treated the same as churned use
 
 **1. Data Requirements:**
 
-- Incorporate pricing, subscription tier, plan type, revenue information to weigh churn impact against customer value.
-- Add geographic level data to segment customers based on geographies.
+- Incorporate pricing, subscription tier, plan type, revenue information to weigh churn impact against customer value. 
+- Add geographic level data to segment customers based on geographies. 
 - Add reactivation details to distinguish between temporary inactivity and true churn, which could also improve model accuracy. 
 
 **2. Product Actions:**
 
-- Provide in-product guidance to encourage progression through the full editing pipeline (e.g. guided checklist; progress bar showing workflow completion status).
-- Deploy targeted interventions differentiated by risk tiers. For example:
- - High Risk users: "Quick Start Guides", dedicated assistance, 24/7 AI chatbot support
- - Medium Risk users: feature discovery prompts, usage tips
- - Low Risk users: loyalty incentives to deepen engagement 
+- Provide in-product guidance to encourage progression through the full editing pipeline (e.g. guided checklist; progress bar showing workflow completion status). 
+- Deploy targeted interventions differentiated by risk tiers. For example: 
+    - High Risk users: "Quick Start Guides", dedicated assistance, 24/7 AI chatbot support 
+    - Medium Risk users: feature discovery prompts, usage tips 
+    - Low Risk users: loyalty incentives to deepen engagement 
 
 **3. Experiments:**
 
-- Test different onboarding efforts that guide users towards early engagement (e.g. "Complete your first edit to unlock advanced features"; step-by-step workflow prompts inside the editor).
-- Experiment with behavioural nudges for users showing early-stage decline (e.g. "Complete your first edit" notifications; reminder nudges after 3 days of inactivity).
+- Test different onboarding efforts that guide users towards early engagement (e.g. "Complete your first edit to unlock advanced features"; step-by-step workflow prompts inside the editor). 
+- Experiment with behavioural nudges for users showing early-stage decline (e.g. "Complete your first edit" notifications; reminder nudges after 3 days of inactivity). 
 - Re-run the models after incorporating financial and reactivation data to evaluate whether predictive performance improves. 
